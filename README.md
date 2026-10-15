@@ -1,4 +1,4 @@
-# ZEEHO 极核每日自动签到
+# ZEEHO 极核每日自动化（签到 + 点赞）
 
 每天自动给极核（ZEEHO / 春风动力 CFMOTO）App 账号签到，跑在 **GitHub Actions** 上，无需服务器、无需手机常开。
 
@@ -136,7 +136,90 @@ H5 全部 22 个接口里没有返回余额的。`integralScore` 是**当天签�
 
 ---
 
-## 五、常见问题
+## 五、每日点赞（独立任务）
+
+极核的互动任务是分开计分的：**发帖 +1、点赞 +1、分享 +1**。
+`zeeho_like.py` 只做其中的「**每日点赞**」这一项 —— 不发帖、不评论、不分享，不向社区产出任何内容。
+
+### 与签到的差异（改代码前必看）
+
+| 项 | 签到 `zeeho_signin.py` | 点赞 `zeeho_like.py` |
+| --- | --- | --- |
+| **域名** | `h5.zeehoev.com`（H5 端） | **`tapi.zeehoev.com`（App 端）** |
+| appId | `AiTXmBrm` | **`S7qPWPU1`** |
+| appSecret | `70c2c7458ab88ca9504ad05…` | **`c5e0da7f4da28df805694ec3…`** |
+| 额外头 | — | `user_id`、`interfaceversion: 2` |
+| 需要 userId | 否 | **是** |
+| 定时 | 每天 08:30 | 每天 08:50 |
+
+两套体系**互不通用**：拿 H5 的 appId 去打 App 端接口会被拦成 `30121 permit error`。
+
+### 接口清单
+
+| 方法 | 路径（`https://tapi.zeehoev.com`） | 用途 |
+| --- | --- | --- |
+| GET | `/v1.0/mine/cfmotoservermine/setting/{userId}` | 查用户资料，含 `data.score` 积分余额 |
+| GET | `/v1.0/social/cfmotoserversocial/community/mineArticleInfo?userId=&page=1&pageSize=10` | 取本人动态列表 |
+| GET | `/v1.0/social/cfmotoserversocial/community/qbTzInfoNewV2?page=1&pageSize=20&postModule=2&slidingType=1` | 公共推荐流（兜底用，默认关闭） |
+| **POST** | `/v1.0/social/cfmotoserversocial/socialCommu/likeFavoriteInfo` | **点赞**，body `{"postId":"…","kindFlag":"0"}` |
+
+### 最关键的坑：body 必须参与签名
+
+App 端签名串结构与 H5 完全一致：
+
+```
+raw  = 查询串 + 请求体 + "appId=S7qPWPU1&nonce=<uuid>&timestamp=<ms>" + <APP_SECRET>
+sign = md5( sha1(raw) 的 hex )
+```
+
+但请求体必须是**实际发出的紧凑 JSON**（`json.dumps(body, separators=(',',':'))`）。
+用空串签名时，GET 能过，**POST 一律返回 `30121 permit error`** —— 这是逆向时最卡人的一步。
+
+### 需要额外一步：拿到 userId
+
+点赞比签到多一个数字形式的 `userId`。三种获取方式，推荐第一种：
+
+1. **脚本自助获取**（最简单）
+   ```bash
+   python zeeho_like.py --token 你的token --resolve-uid
+   ```
+   会依次尝试几个「返回自身资料」的接口，命中就直接打印 `ZEEHO_TOKENS = <token>:<userId>`。
+
+2. **手机抓包**
+   MitM 监听 `tapi.zeehoev.com`，打开极核 App 的「我的」页，
+   请求 URL `/v1.0/mine/cfmotoservermine/setting/<数字>` 里那段**数字**就是 userId。
+
+3. **面板方案**：装 [cluck798/zeeho](https://github.com/cluck798/zeeho) 的 BoxJS 面板，点「获取ID」。
+
+### 配置
+
+| Secret | 值 |
+| --- | --- |
+| `ZEEHO_TOKENS` | `<token>:<userId>`，多账号用 `@` 分隔。例：`aaaa-bbbb:1234567@cccc-dddd:7654321` |
+| `ZEEHO_USER_IDS` | 可选。逗号分隔的 userId 兜底列表（当 `ZEEHO_TOKENS` 里没写 userId 时按序取） |
+| `ENABLE_COMMUNITY_LIKE` | 设为 `1`：自己没有动态时，允许点赞公共流里的热门帖（默认关闭） |
+
+> **透明度说明**：`ZEEHO_TOKENS` 现在是「token + userId」的组合格式，与签到任务共用同一个 Secret 也没问题 ——
+> 签到脚本只取 `:` 前面的部分识别不到时会降级按纯 token 处理；如果你担心串号，
+> 可以在点赞工作流里单独配一个 Secret（比如 `ZEEHO_LIKE_TOKENS`）并改 yml 里的环境变量名。
+
+### 行为策略
+
+默认**只点赞自己的动态**：
+
+1. 先查本人动态列表，找到属于自己 userId 的帖子
+2. 找不到就跳过并提示 —— **绝不默认去点赞别人**
+3. 只有显式开启 `ENABLE_COMMUNITY_LIKE` 时，才会退而去赞公共流里 `likeTimes` 最高的热门帖
+
+这样即使账号从未在社区发过言，也不会对陌生车主造成无意义的打扰。
+
+### 风险提示
+
+- 行为类积分比签到**更容易触发风控**，请只用于自己的主账号，不要用多开小号刷
+- 脚本每步之间加了随机 3–8 秒延时，多账号还会随机错峰至多 10 分钟，尽量模拟真人节奏
+- 一旦出现 `30121/30124/30125 permit error`，说明服务端又轮换密钥了，需要重新抓接口
+
+## 六、常见问题
 
 **Q：Actions 里报 `未配置 secrets.ZEEHO_TOKENS`**
 A：Secret 名字要完全一致，且大小写敏感。
@@ -161,23 +244,30 @@ A：支持。`ZEEHO_TOKENS` 里用逗号或换行分隔多个 Token，脚本会�
 
 ---
 
-## 六、目录结构
+## 七、目录结构
 
 ```
 .
-├── .github/workflows/signin.yml   # GitHub Actions 定时任务
-├── zeeho_signin.py                # 签到脚本（纯标准库）
-├── .gitignore                     # 已排除凭据文件
+├── .github/
+│   ├── workflows/signin.yml   # 定时任务：每日 08:30 签到
+│   └── workflows/like.yml     # 定时任务：每日 08:50 点赞
+├── zeeho_signin.py            # 签到脚本（H5 端，纯标准库）
+├── zeeho_like.py              # 点赞脚本（App 端，纯标准库）
+├── probe_social.py            # 社区接口探测工具（需真 token）
+├── .gitignore                 # 已排除凭据文件
 └── README.md
 ```
 
 ---
 
-## 七、致谢
+## 八、致谢
 
 - 签到流程与签名算法来自 [MonicaGmm/zeeho-quanx](https://github.com/MonicaGmm/zeeho-quanx)
 - macOS 菜单栏版本见 [desfate/macOS_for_zeeho_auto_signin](https://github.com/desfate/macOS_for_zeeho_auto_signin)
+- App 端社区接口（`tapi.zeehoev.com`、`S7qPWPU1`、likeFavoriteInfo 等）参考
+  [cluck798/zeeho](https://github.com/cluck798/zeeho)；本仓库只取其中的**点赞**部分，
+  并修正了它签名时漏传 body 导致 POST 被拦的问题
 
-## 八、许可
+## 九、许可
 
 MIT。使用本软件产生的账号封禁、积分异常、数据丢失等后果由使用者自行承担。
