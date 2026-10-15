@@ -54,6 +54,8 @@ P_MINE_ARTICLES = "/v1.0/social/cfmotoserversocial/community/mineArticleInfo"
 P_COMMUNITY = "/v1.0/social/cfmotoserversocial/community/qbTzInfoNewV2"
 P_LIKE = "/v1.0/social/cfmotoserversocial/socialCommu/likeFavoriteInfo"
 P_SETTING = "/v1.0/mine/cfmotoservermine/setting/{uid}"
+# 积分余额：这条**不需要 userId**，优先用它
+P_TOTAL_INTEGRAL = "/v1.0/mine/cfmotoservermine/integral/totalIntegral"
 
 TIMEOUT = 20
 MAX_RETRY = 2
@@ -74,20 +76,40 @@ def mask(t):
 
 
 # ---------------- 签名与请求 ----------------
-def sign_str(query_str, body_str):
-    nonce = str(uuid.uuid4())
+def app_nonce(ts):
+    """
+    App 端 nonce 不是 UUID，而是 <毫秒时间戳> + 16 位随机字母数字。
+    （H5 端才是 UUID —— 见 SignUtil.sign 里的 "h5".equals 分支）
+    """
+    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    return "%s%s" % (ts, "".join(random.choice(chars) for _ in range(16)))
+
+
+def to_query(params):
+    """
+    照 SignUtil.toQuery: 只跳过 None，然后**按 key 字典序排序**再拼。
+    顺序不同会导致签名不一致 —— 这是最容易踩的坑。
+    """
+    keys = sorted([k for k, v in params.items() if v is not None])
+    return "&".join("%s=%s" % (k, params[k]) for k in keys)
+
+
+def sign_str(query_str, body_str, method="GET"):
     ts = str(int(time.time() * 1000))
+    nonce = app_nonce(ts)
+    # DELETE 时 body 强制为空（与 SignUtil 一致）
+    eff_body = "" if method == "DELETE" else body_str
     param = "appId=%s&nonce=%s&timestamp=%s" % (APP_ID, nonce, ts)
-    raw = query_str + body_str + param + APP_SECRET
+    raw = query_str + eff_body + param + APP_SECRET
     sg = hashlib.md5(hashlib.sha1(raw.encode("utf-8")).hexdigest().encode("utf-8")).hexdigest()
     return sg, param, ts, nonce
 
 
 def request(method, path, token, uid, params=None, body=None):
     params = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
-    query_str = "&".join("%s=%s" % (k, v) for k, v in params.items())
+    query_str = to_query(params)
     body_str = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    sg, param, ts, nonce = sign_str(query_str, body_str)
+    sg, param, ts, nonce = sign_str(query_str, body_str, method)
 
     headers = {
         "Content-Type": "application/json;charset=UTF-8",
@@ -287,12 +309,25 @@ def autofill_uid(token):
 
 
 def fetch_score(token, uid):
-    """查积分余额；没有 userId 时跳过（不影响点赞本身）"""
-    if not uid:
-        return None
-    st, d = request("GET", P_SETTING.format(uid=uid), token, uid)
-    if st == 200 and isinstance(d, dict) and isinstance(d.get("data"), dict):
-        return d["data"].get("score")
+    """
+    查积分余额。优先走 /integral/totalIntegral（不依赖 userId），
+    失败再退到 /setting/{userId}（需要 userId，没有就返回 None）。
+    """
+    st, d = request("GET", P_TOTAL_INTEGRAL, token, uid)
+    if st == 200 and isinstance(d, dict) and d.get("code") == OK_CODE:
+        v = d.get("data")
+        if isinstance(v, dict):
+            for k in ("score", "totalIntegral", "integral", "usableIntegral"):
+                if isinstance(v.get(k), int):
+                    return v[k]
+        elif isinstance(v, int):
+            return v
+    if uid:
+        st2, d2 = request("GET", P_SETTING.format(uid=uid), token, uid)
+        if st2 == 200 and isinstance(d2, dict) and isinstance(d2.get("data"), dict):
+            s = d2["data"].get("score")
+            if isinstance(s, int):
+                return s
     return None
 
 

@@ -158,22 +158,41 @@ H5 全部 22 个接口里没有返回余额的。`integralScore` 是**当天签�
 
 | 方法 | 路径（`https://tapi.zeehoev.com`） | 用途 |
 | --- | --- | --- |
-| GET | `/v1.0/mine/cfmotoservermine/setting/{userId}` | 查用户资料，含 `data.score` 积分余额 |
+| GET | `/v1.0/mine/cfmotoservermine/integral/totalIntegral` | 积分余额，**不需要 userId** |
+| GET | `/v1.0/mine/cfmotoservermine/setting/{userId}` | 用户资料，含 `data.score` |
 | GET | `/v1.0/social/cfmotoserversocial/community/mineArticleInfo?userId=&page=1&pageSize=10` | 取本人动态列表 |
 | GET | `/v1.0/social/cfmotoserversocial/community/qbTzInfoNewV2?page=1&pageSize=20&postModule=2&slidingType=1` | 公共推荐流（兜底用，默认关闭） |
 | **POST** | `/v1.0/social/cfmotoserversocial/socialCommu/likeFavoriteInfo` | **点赞**，body `{"postId":"…","kindFlag":"0"}` |
 
-### 最关键的坑：body 必须参与签名
+同源但本仓库**未启用**的接口（已从 `ZEEHO助手.apk` 完整逆向出来，留档备用）：
 
-App 端签名串结构与 H5 完全一致：
+| 方法 | 路径 | body / 参数 |
+| --- | --- | --- |
+| POST | `…/commonArticle` | 发帖：`{postSubInfo:{topicList:[]}, topicid:"", postcontent:"文本"}` |
+| PUT | `…/article/share/{postId}` | 分享（无 body） |
+| DELETE | `…/commonArticle/deleteArticle?articleId=&postType=1` | 删帖 |
+| GET | `…/integral/adjustByShare` | 领取分享积分 |
+
+完整顺序（APK 的 `TaskRunner.autoPublish`）：发帖 → 等 2s → 查动态（取 `data[0]`，ID 依次试
+`tuuid` → `id` → `articleId`）→ 等 1s → 点赞 → 等 1s → 分享 → 领积分 → 等 2s → 删除。
+
+### 签名的三个细节（照抄 `SignUtil.java`）
 
 ```
-raw  = 查询串 + 请求体 + "appId=S7qPWPU1&nonce=<uuid>&timestamp=<ms>" + <APP_SECRET>
+raw  = 查询串 + 请求体 + "appId=S7qPWPU1&nonce=<nonce>&timestamp=<ms>" + <APP_SECRET>
 sign = md5( sha1(raw) 的 hex )
 ```
 
-但请求体必须是**实际发出的紧凑 JSON**（`json.dumps(body, separators=(',',':'))`）。
-用空串签名时，GET 能过，**POST 一律返回 `30121 permit error`** —— 这是逆向时最卡人的一步。
+容易出错的三处：
+
+1. **查询串要按 key 字典序排序**（`Collections.sort`）。插入顺序和排序顺序在多参数时不同，
+   签名就会对不上。→ 见 `to_query()`
+2. **App 端 nonce 不是 UUID**，是 `<毫秒时间戳> + 16 位随机字母数字`；
+   只有 H5 端才用 UUID。→ 见 `app_nonce()`
+3. **DELETE 时请求体强制为空**（`SignUtil` 里 `"DELETE".equals(method)` 分支）
+
+其余规则：查询串不做 URL 编码；请求体必须是**实际发出的紧凑 JSON**
+（`json.dumps(body, separators=(',',':'))`）—— 用空串签名时 GET 能过，**POST 一律被拦 `30121`**。
 
 ### userId 是**可选的**，脚本会自己想办法
 
@@ -231,6 +250,21 @@ python zeeho_like.py --decode-url "https://h5.zeehoev.com/post?uuid=MjAyNjEwMTUw
 > **透明度说明**：`ZEEHO_TOKENS` 现在是「token + userId」的组合格式，与签到任务共用同一个 Secret 也没问题 ——
 > 签到脚本只取 `:` 前面的部分识别不到时会降级按纯 token 处理；如果你担心串号，
 > 可以在点赞工作流里单独配一个 Secret（比如 `ZEEHO_LIKE_TOKENS`）并改 yml 里的环境变量名。
+
+### 备用签到路径（服务端换 key 时的退路）
+
+`ZEEHO助手.apk` 走的是**另一套**签到接口，已实测同样可用（假 token 均返回 401，即签名通过）：
+
+| | 现有脚本 | 备用 |
+| --- | --- | --- |
+| 路径 | `/cfmotoservermine/**H5/**signin` | `/cfmotoservermine/signin`（**无 H5 前缀**） |
+| 密钥 | `AiTXmBrm` + `70c2…` | `S7qPWPU1` + `c5e0…`（复用 App 端那套） |
+| 额外参数 | — | `server_name=SMART` |
+| nonce | UUID | UUID（走 h5 分支） |
+
+若哪天签到报 `30125 permit error`（密钥轮换），把 `zeeho_signin.py` 里的
+`APP_ID`/`APP_SECRET` 换成 `S7qPWPU1`/`c5e0…`、路径去掉 `/H5/`、GET 参数加上
+`server_name=SMART`，多半就能救回来。
 
 ### 行为策略
 
