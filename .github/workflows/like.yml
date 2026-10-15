@@ -1,4 +1,4 @@
-name: ZEEHO 每日点赞
+name: ZEEHO 每日互动任务
 
 on:
   schedule:
@@ -9,24 +9,24 @@ on:
       mode:
         description: "运行模式"
         required: false
-        default: "like"
+        default: "run"
         type: choice
         options:
-          - "like"
+          - "run"
           - "status-only"
           - "dry-run"
           - "resolve-uid"
       community:
-        description: "自己没发帖时，允许点赞公共动态"
+        description: "自己没动态时，允许点赞公共动态"
         required: false
         default: "false"
         type: choice
         options: ["false", "true"]
 
 jobs:
-  like:
+  interact:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: 检出代码
@@ -37,11 +37,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 执行每日点赞
+      - name: 执行每日互动任务
         env:
           ZEEHO_TOKENS: ${{ secrets.ZEEHO_TOKENS }}
           ZEEHO_USER_IDS: ${{ secrets.ZEEHO_USER_IDS }}
           ZEEHO_POST_ID: ${{ secrets.ZEEHO_POST_ID }}
+          ZEEHO_POST_CONTENT: ${{ secrets.ZEEHO_POST_CONTENT }}
+          INTERACT_STEPS: ${{ secrets.INTERACT_STEPS }}
           ENABLE_COMMUNITY_LIKE: ${{ github.event.inputs.community }}
           NOTIFY_BARK: ${{ secrets.NOTIFY_BARK }}
           NOTIFY_SERVERCHAN: ${{ secrets.NOTIFY_SERVERCHAN }}
@@ -55,7 +57,7 @@ jobs:
           fi
 
           if [ -z "${ZEEHO_TOKENS}" ]; then
-            echo "::error::未配置 secrets.ZEEHO_TOKENS。直接填签到用的纯 token 即可，userId 可选"
+            echo "::error::未配置 secrets.ZEEHO_TOKENS。直接填签到用的纯 token 即可"
             exit 1
           fi
 
@@ -72,6 +74,6 @@ jobs:
 
           python zeeho_like.py $EXTRA || {
             code=$?
-            echo "::warning::zeeho_like.py 退出码 $code（2 通常表示没有可点赞的动态）"
+            echo "::warning::zeeho_like.py 退出码 $code（2 表示没有任何步骤产出）"
             exit 0
           }

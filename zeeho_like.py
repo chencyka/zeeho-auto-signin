@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-ZEEHO 极核 · 每日点赞自动化
-============================
+ZEEHO 极核 · 每日互动任务（发帖 + 点赞 + 分享）
+==============================================
 
-只做「每日点赞」这一项互动任务（+1 积分），不发帖、不评论、不分享。
+一天最多 3 分：发帖 +1、点赞 +1、分享 +1。
+流程移植自 ZEEHO助手.apk 的 TaskRunner.autoPublish：
+
+    发帖 → 点赞 → 分享 → 领分享积分 → 删除该帖
+
+发的是**临时帖**，拿完分就删掉，不在主页留内容。
+删除带硬保护：只有本次自己创建的才会被删，ZEEHO_POST_ID 指定的既有动态绝不删。
+
+签到由 zeeho_signin.py 单独负责，两者互不影响。
 
 与签到脚本的差异（关键）
 ------------------------
@@ -28,17 +36,23 @@ ZEEHO 极核 · 每日点赞自动化
 
 配置
 ----
-ZEEHO_TOKENS   : 多账号用 "@" 分隔, 每条形如  <token>:<userId>
-                 例: aaaa-bbbb-cccc:1234567@dddd-eeee-ffff:7654321
-                 若不带 ":userId", 则尝试从 ZEEHO_USER_IDS 按序取值
-ZEEHO_USER_IDS : 可选, 逗号分隔的 userId 兜底列表
-ENABLE_COMMUNITY_LIKE : 设为 1 时, 自己没有帖子才会去赞公共流帖（默认关闭）
+ZEEHO_TOKENS       : 多账号用 "@" 分隔, 每条形如 <token>:<userId>
+                     例: aaaa-bbbb-cccc:1234567@dddd-eeee-ffff:7654321
+                     不带 ":userId" 也完全可以, 脚本会自动解析
+INTERACT_STEPS     : 可选, 逗号分隔 publish,like,share,delete
+                     不填默认全做; 填了 ZEEHO_POST_ID 时自动降为只点赞
+ZEEHO_POST_ID      : 可选, 已有动态 ID 或整条分享链接(自动解 Base64)
+ZEEHO_POST_CONTENT : 可选, 临时帖内容, 默认 "开心的一天"
+ZEEHO_USER_IDS     : 可选, 逗号分隔的 userId 兜底列表
+ENABLE_COMMUNITY_LIKE : 设为 1 时, 拿不到动态才会去赞公共流帖（默认关闭）
 
 用法
 ----
     python zeeho_like.py --dry-run                 # 不联网, 自检
-    python zeeho_like.py --status-only             # 只查状态, 不点赞
+    python zeeho_like.py --status-only             # 只查积分, 不操作
     python zeeho_like.py --token <tk> --user-id <uid>
+    python zeeho_like.py --steps publish,like      # 只发帖+点赞, 保留不删
+    python zeeho_like.py --content "今天天气不错"    # 自定义发帖内容
     python zeeho_like.py --spread-seconds 600      # 多账号随机错峰上限(秒)
 """
 import os, re, sys, ssl, time, json, uuid, random, hashlib, argparse, http.client, urllib.parse
@@ -56,6 +70,15 @@ P_LIKE = "/v1.0/social/cfmotoserversocial/socialCommu/likeFavoriteInfo"
 P_SETTING = "/v1.0/mine/cfmotoservermine/setting/{uid}"
 # 积分余额：这条**不需要 userId**，优先用它
 P_TOTAL_INTEGRAL = "/v1.0/mine/cfmotoservermine/integral/totalIntegral"
+
+# —— 完整互动任务（移植自 ZEEHO助手.apk 的 ApiClient / TaskRunner）——
+P_PUBLISH = "/v1.0/social/cfmotoserversocial/commonArticle"
+P_SHARE = "/v1.0/social/cfmotoserversocial/article/share/{pid}"
+P_DELETE = "/v1.0/social/cfmotoserversocial/commonArticle/deleteArticle"
+P_ADJUST_SHARE = "/v1.0/mine/cfmotoservermine/integral/adjustByShare"
+
+DEFAULT_CONTENT = "开心的一天"
+ALL_STEPS = ("publish", "like", "share", "delete")
 
 TIMEOUT = 20
 MAX_RETRY = 2
@@ -409,11 +432,50 @@ def post_id_from_url(url):
     return ""
 
 
-def do_like(acc, status_only=False, allow_community=False, auto_uid=True, forced_post=None):
+def api_publish(tk, uid, content):
+    """发帖。body 结构照搬 APK：{postSubInfo:{topicList:[]}, topicid:"", postcontent:...}"""
+    body = {"postSubInfo": {"topicList": []}, "topicid": "", "postcontent": content}
+    st, d = request("POST", P_PUBLISH, tk, uid, None, body)
+    ok = st == 200 and str(d.get("code", "")) == OK_CODE
+    if ok:
+        # 发布响应里通常直接带 id；取不到就返回 None 让调用方去查列表
+        pid = extract_id(d.get("data"))
+        return ok, pid, ""
+    return False, None, str(d.get("message", "HTTP %s" % st))
+
+
+def api_share(tk, uid, post_id):
+    st, d = request("PUT", P_SHARE.format(pid=post_id), tk, uid)
+    ok = st == 200 and str(d.get("code", "")) == OK_CODE
+    return ok, str(d.get("message", "")) if not ok else ""
+
+
+def api_delete(tk, uid, post_id):
+    st, d = request("DELETE", P_DELETE, tk, uid, {"articleId": post_id, "postType": "1"})
+    ok = st == 200 and str(d.get("code", "")) == OK_CODE
+    return ok, str(d.get("message", "")) if not ok else ""
+
+
+def api_adjust_share(tk, uid):
+    """领取分享积分（每次分享后调一次，服务端自己按天去重）"""
+    st, d = request("GET", P_ADJUST_SHARE, tk, uid)
+    return st == 200 and str(d.get("code", "")) == OK_CODE, str(d.get("message", ""))
+
+
+def api_like(tk, uid, post_id):
+    return request("POST", P_LIKE, tk, uid, None, {"postId": str(post_id), "kindFlag": "0"})
+
+
+def do_interact(acc, steps, allow_community=False, auto_uid=True, forced_post=None,
+                content=DEFAULT_CONTENT, gap=(2, 4), status_only=False):
     tk = acc["token"]
     uid = acc["userId"] or ""
-    res = {"ok": False, "liked": False, "postId": "", "score": None,
+    res = {"ok": True, "published": False, "liked": False, "shared": False,
+           "deleted": False, "postId": "", "score": None,
            "uid": uid, "detail": [], "err": ""}
+
+    def nap():
+        time.sleep(random.randint(gap[0], gap[1]))
 
     # userId 不是硬要求：先尽力自动补，补不到也能继续跑（服务端按 token 识别）
     if not uid and auto_uid:
@@ -422,25 +484,35 @@ def do_like(acc, status_only=False, allow_community=False, auto_uid=True, forced
 
     res["score"] = fetch_score(tk, uid)
     if status_only:
-        res["ok"] = True
         return res
 
-    # 1) 找自己的帖子
     post = forced_post or None
-    if post:
-        res["detail"].append("使用手动指定的动态 postId=%s（跳过查询）" % post)
-    else:
-        # 没有 userId 时不传该参数，服务端据 token 返回本人动态
+    # 只有本次自己创建的动态才允许删除 —— 绝不能删用户已有的内容
+    self_published = False
+
+    # ---------- 1) 发帖 ----------
+    if "publish" in steps and not post:
+        ok, pid, msg = api_publish(tk, uid, content)
+        if ok:
+            self_published = True
+            res["published"] = True
+            post = pid
+            res["detail"].append("[发帖] 内容=%s%s" % (content, (" id=%s" % pid) if pid else ""))
+        else:
+            res["detail"].append("[发帖] 失败: %s" % msg)
+        nap()
+
+    # ---------- 2) 确定 postId ----------
+    if not post:
         p = {"page": 1, "pageSize": 10}
         if uid:
             p["userId"] = uid
         st, d = request("GET", P_MINE_ARTICLES, tk, uid, p)
         if st == 200 and d.get("code") == OK_CODE:
             post = pick_post_id(d.get("data"), uid)
-        res["detail"].append("查询本人动态: HTTP %s, postId=%s%s"
-                             % (st, post or "无", "" if uid else "（未提供 userId，按 token 识别）"))
+        res["detail"].append("[查动态] postId=%s" % (post or "无"))
 
-    # 2) 兜底: 公共流（默认关闭）—— 挑一条热门帖，通常是官方/车主内容
+    # ---------- 3) 兜底：公共流（默认关闭）----------
     if not post and allow_community:
         st, d = request("GET", P_COMMUNITY, tk, uid,
                         {"page": 1, "pageSize": 20, "postModule": 2, "slidingType": 1})
@@ -455,34 +527,49 @@ def do_like(acc, status_only=False, allow_community=False, auto_uid=True, forced
                 if pid:
                     post = pid
                     break
-        res["detail"].append("查询公共动态: %s" % (post or "无"))
+        res["detail"].append("[公共动态] postId=%s" % (post or "无"))
 
     if not post:
-        res["ok"] = True
-        res["err"] = ("自己的动态列表是空的。" if uid
+        res["err"] = ("发不出动态，动态列表也是空的。" if uid
                       else "取不到 userId，且无法按 token 识别到本人动态。")
-        res["err"] += (" 想在这种情况也拿分，请把 Secret ENABLE_COMMUNITY_LIKE 设为 1"
-                       "（会去赞社区推荐流里的热门内容），或先手动发过一条动态。")
+        res["err"] += (" 可设 ENABLE_COMMUNITY_LIKE=1 去赞推荐流热门内容，"
+                       "或先在社区手动发一条动态。")
         return res
 
-    # 3) 点赞
-    st, d = request("POST", P_LIKE, tk, uid, None, {"postId": str(post), "kindFlag": "0"})
-    code = str(d.get("code", ""))
-    msg = d.get("message", "")
     res["postId"] = post
-    res["detail"].append("点赞 %s: HTTP %s, code=%s, %s" % (post, st, code, msg))
-    if st == 200 and code == OK_CODE:
-        res["liked"] = True
-        res["ok"] = True
-    elif code in ("30121", "30124", "30125") or "permit" in str(msg):
-        res["err"] = "签名被拒(%s) —— App 端密钥可能已轮换" % code
-    elif st == 401 or code == "40001":
-        res["err"] = "Token 失效(%s)，请重新抓取" % (code or st)
-    else:
-        res["ok"] = True
-        res["err"] = "点赞未成功: %s %s" % (code, msg)
 
-    # 4) 事后积分（对比）；没 userId 时跳过
+    # ---------- 4) 点赞 ----------
+    if "like" in steps:
+        st, d = api_like(tk, uid, post)
+        code, msg = str(d.get("code", "")), d.get("message", "")
+        res["liked"] = st == 200 and code == OK_CODE
+        res["detail"].append("[点赞] %s -> %s" % (post, "成功" if res["liked"] else "%s %s" % (code, msg)))
+        if not res["liked"] and (code in ("30121", "30124", "30125") or "permit" in str(msg)):
+            res["err"] = "签名被拒(%s) —— App 端密钥可能已轮换" % code
+        elif not res["liked"] and (st == 401 or code == "40001"):
+            res["err"] = "Token 失效(%s)，请重新抓取" % (code or st)
+        nap()
+
+    # ---------- 5) 分享 + 领积分 ----------
+    if "share" in steps:
+        ok, msg = api_share(tk, uid, post)
+        res["shared"] = ok
+        res["detail"].append("[分享] -> %s" % ("成功" if ok else msg))
+        nap()
+        if ok:
+            aok, amsg = api_adjust_share(tk, uid)
+            res["detail"].append("[分享积分] -> %s" % ("已领取" if aok else amsg))
+
+    # ---------- 6) 删除本次临时帖 ----------
+    if "delete" in steps and self_published:
+        nap()
+        ok, msg = api_delete(tk, uid, post)
+        res["deleted"] = ok
+        res["detail"].append("[删帖] -> %s" % ("已删除" if ok else msg))
+    elif "delete" in steps:
+        res["detail"].append("[删帖] 跳过：目标是既有动态，不是本次创建的")
+
+    # ---------- 7) 事后积分（对比）----------
     after = fetch_score(tk, uid)
     if after is not None:
         res["score_after"] = after
@@ -494,14 +581,23 @@ def do_like(acc, status_only=False, allow_community=False, auto_uid=True, forced
 def write_summary(rows):
     if not SUMMARY_FILE:
         return
-    lines = ["## 🎯 ZEEHO 极核 · 每日点赞", "",
-             "| 账号 | userId | 结果 | 点赞对象 | 积分变化 |", "|---|---|---|---|---|"]
+    def tick(b):
+        return "是" if b else "—"
+
+    lines = ["## ZEEHO 极核 · 每日互动任务", "",
+             "| 账号 | userId | 发帖 | 点赞 | 分享 | 删除 | 动态ID | 积分变化 |",
+             "|---|---|---|---|---|---|---|---|"]
     for r in rows:
-        lines.append("| %s | %s | %s | %s | %s |" % (
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
             r["name"], r.get("uid") or "自动",
-            ("✅ 已点赞" if r.get("liked") else ("⚠️ " + (r.get("err") or "跳过"))),
+            tick(r.get("published")), tick(r.get("liked")), tick(r.get("shared")),
+            tick(r.get("deleted")),
             r.get("postId") or "—",
             ("%s → %s" % (r.get("score"), r.get("score_after"))) if r.get("score_after") is not None else "—"))
+    for r in rows:
+        if r.get("err"):
+            lines.append("") 
+            lines.append("- **%s**: %s" % (r["name"], r["err"]))
     lines += ["", "由 GitHub Actions 自动执行 · 北京时间 %s" % time.strftime("%Y-%m-%d %H:%M:%S",
               time.localtime(time.time() + 8 * 3600))]
     try:
@@ -538,7 +634,10 @@ def main():
     ap.add_argument("--spread-seconds", type=int, default=0)
     ap.add_argument("--community", action="store_true", help="自己没帖时允许赞公共流")
     ap.add_argument("--resolve-uid", action="store_true", help="用现有 token 自助获取 userId")
-    ap.add_argument("--post-id", default="", help="直接指定要点赞的动态 ID，跳过查询")
+    ap.add_argument("--post-id", default="", help="直接指定要点赞的动态 ID，跳过发帖与查询")
+    ap.add_argument("--steps", default="", help="逗号分隔: publish,like,share,delete")
+    ap.add_argument("--content", default="", help="发帖内容")
+    ap.add_argument("--keep", action="store_true", help="发完帖不删除（默认会删掉临时帖）")
     ap.add_argument("--decode-url", default="",
                     help="粘贴动态分享链接，自动解出 postId（如 https://h5.zeehoev.com/post?uuid=xxx）")
     a = ap.parse_args()
@@ -577,11 +676,26 @@ def main():
                 raw_pids = raw_pids.replace(piece, post_id_from_url(piece) or piece)
     pids = parse_post_ids(raw_pids, len(valid))
 
+    # 步骤：默认「发帖→点赞→分享→删除」整套（+3 分）；
+    # 一旦手动指定了 postId，就只做点赞，不去动既有内容
+    raw_steps = (a.steps or os.environ.get("INTERACT_STEPS", "")).strip()
+    if raw_steps:
+        steps = tuple(s.strip() for s in raw_steps.split(",") if s.strip() in ALL_STEPS)
+    elif any(pids):
+        steps = ("like",)
+    else:
+        steps = ALL_STEPS
+    if a.keep and "delete" in steps:
+        steps = tuple(s for s in steps if s != "delete")
+    content = a.content or os.environ.get("ZEEHO_POST_CONTENT", "") or DEFAULT_CONTENT
+
     if a.dry_run:
         for i, x in enumerate(valid, 1):
             log("  #%d token=%s userId=%s postId=%s"
                 % (i, mask(x["token"]), x["userId"] or "(自动解析)", pids[i - 1] or "(自动查找)"))
-        log("✅ 配置可用。userId 与 postId 都不是必填项 —— 缺失时脚本会自己想办法。")
+        log("  执行步骤: %s" % ", ".join(steps))
+        log("  发帖内容: %s" % content)
+        log("  删除临时帖: %s" % ("是" if "delete" in steps else "否"))
         return 0
 
     rows = []
@@ -590,7 +704,8 @@ def main():
         log("\n" + "=" * 70)
         extra = "  postId=%s" % pids[i - 1] if pids[i - 1] else ""
         log("▶ %s  userId=%s%s" % (name, x["userId"] or "未提供（自动解析）", extra))
-        r = do_like(x, a.status_only, allow_community, forced_post=pids[i - 1] or None)
+        r = do_interact(x, steps, allow_community, forced_post=pids[i - 1] or None,
+                        content=content, status_only=a.status_only)
         for d in r["detail"]:
             log("   " + d)
         if r.get("score_after") is not None:
@@ -605,12 +720,15 @@ def main():
             time.sleep(wait)
 
     write_summary(rows)
-    ok = sum(1 for r in rows if r.get("liked"))
+    done = sum(1 for r in rows if any([r.get("published"), r.get("liked"), r.get("shared")]))
     log("\n" + "=" * 70)
-    log("完成: 点赞成功 %d / %d" % (ok, len(rows)))
-    notify("极核点赞 %d/%d" % (ok, len(rows)),
-           "\n".join("%s: %s" % (r["name"], "已点赞" if r.get("liked") else (r.get("err") or "跳过")) for r in rows))
-    return 0 if ok or a.status_only else 2
+    log("完成: 有产出的账号 %d / %d （步骤: %s）" % (done, len(rows), ", ".join(steps)))
+    notify("极核互动 %d/%d" % (done, len(rows)),
+           "\n".join("%s: 发帖%s 点赞%s 分享%s" % (
+               r["name"], "√" if r.get("published") else "×",
+               "√" if r.get("liked") else "×", "√" if r.get("shared") else "×")
+               for r in rows))
+    return 0 if done or a.status_only else 2
 
 
 if __name__ == "__main__":
