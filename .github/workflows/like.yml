@@ -41,6 +41,7 @@ jobs:
         env:
           ZEEHO_TOKENS: ${{ secrets.ZEEHO_TOKENS }}
           ZEEHO_USER_IDS: ${{ secrets.ZEEHO_USER_IDS }}
+          ZEEHO_POST_ID: ${{ secrets.ZEEHO_POST_ID }}
           ENABLE_COMMUNITY_LIKE: ${{ github.event.inputs.community }}
           NOTIFY_BARK: ${{ secrets.NOTIFY_BARK }}
           NOTIFY_SERVERCHAN: ${{ secrets.NOTIFY_SERVERCHAN }}

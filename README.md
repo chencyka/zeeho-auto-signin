@@ -205,9 +205,28 @@ sign = md5( sha1(raw) 的 hex )
 
 | Secret | 值 |
 | --- | --- |
-| `ZEEHO_TOKENS` | `<token>:<userId>`，多账号用 `@` 分隔。例：`aaaa-bbbb:1234567@cccc-dddd:7654321` |
-| `ZEEHO_USER_IDS` | 可选。逗号分隔的 userId 兜底列表（当 `ZEEHO_TOKENS` 里没写 userId 时按序取） |
+| `ZEEHO_TOKENS` | Bearer Token，多账号用 `@` 分隔。**直接填签到用的那串即可** |
+| `ZEEHO_POST_ID` | **推荐**。要点赞的动态 ID（或整条分享链接），见下方★ |
+| `ZEEHO_USER_IDS` | 可选。逗号分隔的 userId，只用于显示积分余额 |
 | `ENABLE_COMMUNITY_LIKE` | 设为 `1`：自己没有动态时，允许点赞公共流里的热门帖（默认关闭） |
+
+★ **一句话拿到 `ZEEHO_POST_ID`**（推荐，最省事）
+
+在极核 App 里打开**你自己的某条动态** → 分享 → 复制链接，会得到形如：
+
+```
+https://h5.zeehoev.com/post?time=1792056147099&uuid=MjAyNjEwMTUwMDg4MDkzMTU=
+```
+
+那个 `uuid=` 就是 postId 的 Base64。直接把**整条链接**粘进 `ZEEHO_POST_ID` 即可，脚本自己解：
+
+```bash
+python zeeho_like.py --decode-url "https://h5.zeehoev.com/post?uuid=MjAyNjEwMTUwMDg4MDkzMTU="
+# 解出的 postId = 20261015008809315
+```
+
+配了它，脚本会跳过动态查询直接点赞，**完全不依赖 userId**。
+多账号时用 `@` 分隔；只填一个则所有账号共用。
 
 > **透明度说明**：`ZEEHO_TOKENS` 现在是「token + userId」的组合格式，与签到任务共用同一个 Secret 也没问题 ——
 > 签到脚本只取 `:` 前面的部分识别不到时会降级按纯 token 处理；如果你担心串号，

@@ -125,7 +125,11 @@ def parse_body(txt):
     try:
         return json.loads(txt)
     except Exception:
-        return {"_raw": txt, "code": "-2", "message": "非 JSON 响应"}
+        pass
+    # 鉴权层返回的是 XML：<InvalidTokenException><error>invalid_token</error>…
+    if "invalid_token" in txt:
+        return {"code": "401", "message": "invalid_token（Token 无效或已过期）"}
+    return {"_raw": txt, "code": "-2", "message": "非 JSON 响应"}
 
 
 def pick_post_id(data, uid=""):
@@ -329,7 +333,48 @@ def resolve_uid(token):
     return None
 
 
-def do_like(acc, status_only=False, allow_community=False, auto_uid=True):
+def parse_post_ids(raw, n):
+    """
+    解析 ZEEHO_POST_ID。
+    支持 @ 分隔按账号顺序对应；若只给一个值则所有账号共用。
+    """
+    parts = [x.strip() for x in (raw or "").split("@") if x.strip()]
+    if not parts:
+        return [""] * n
+    if len(parts) == 1:
+        return parts * n
+    return [parts[i] if i < len(parts) else "" for i in range(n)]
+
+
+def b64_decode(s):
+    """宽容的 Base64 解码（自动补齐 padding）"""
+    try:
+        import base64
+        s = s.strip()
+        return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def post_id_from_url(url):
+    """
+    从动态分享链接里解出 postId。
+    链接形态: https://h5.zeehoev.com/post?time=1792056147099&uuid=MjAyNjEwMTUwMDg4MDkzMTU=
+             其中 uuid 是 postId 的 Base64
+    """
+    import urllib.parse as up
+    m = re.search(r"[?&]uuid=([^&#]+)", url)
+    if m:
+        dec = b64_decode(up.unquote(m.group(1)))
+        if dec.isdigit():
+            return dec
+    m = re.search(r"\b(\d{15,20})\b", url)  # 已经是明文数字
+    if m:
+        return m.group(1)
+    return ""
+
+
+def do_like(acc, status_only=False, allow_community=False, auto_uid=True, forced_post=None):
     tk = acc["token"]
     uid = acc["userId"] or ""
     res = {"ok": False, "liked": False, "postId": "", "score": None,
@@ -345,16 +390,20 @@ def do_like(acc, status_only=False, allow_community=False, auto_uid=True):
         res["ok"] = True
         return res
 
-    # 1) 找自己的帖子 —— 没有 userId 时不传该参数，服务端据 token 返回本人动态
-    post = None
-    p = {"page": 1, "pageSize": 10}
-    if uid:
-        p["userId"] = uid
-    st, d = request("GET", P_MINE_ARTICLES, tk, uid, p)
-    if st == 200 and d.get("code") == OK_CODE:
-        post = pick_post_id(d.get("data"), uid)
-    res["detail"].append("查询本人动态: HTTP %s, postId=%s%s"
-                         % (st, post or "无", "" if uid else "（未提供 userId，按 token 识别）"))
+    # 1) 找自己的帖子
+    post = forced_post or None
+    if post:
+        res["detail"].append("使用手动指定的动态 postId=%s（跳过查询）" % post)
+    else:
+        # 没有 userId 时不传该参数，服务端据 token 返回本人动态
+        p = {"page": 1, "pageSize": 10}
+        if uid:
+            p["userId"] = uid
+        st, d = request("GET", P_MINE_ARTICLES, tk, uid, p)
+        if st == 200 and d.get("code") == OK_CODE:
+            post = pick_post_id(d.get("data"), uid)
+        res["detail"].append("查询本人动态: HTTP %s, postId=%s%s"
+                             % (st, post or "无", "" if uid else "（未提供 userId，按 token 识别）"))
 
     # 2) 兜底: 公共流（默认关闭）—— 挑一条热门帖，通常是官方/车主内容
     if not post and allow_community:
@@ -454,7 +503,15 @@ def main():
     ap.add_argument("--spread-seconds", type=int, default=0)
     ap.add_argument("--community", action="store_true", help="自己没帖时允许赞公共流")
     ap.add_argument("--resolve-uid", action="store_true", help="用现有 token 自助获取 userId")
+    ap.add_argument("--post-id", default="", help="直接指定要点赞的动态 ID，跳过查询")
+    ap.add_argument("--decode-url", default="",
+                    help="粘贴动态分享链接，自动解出 postId（如 https://h5.zeehoev.com/post?uuid=xxx）")
     a = ap.parse_args()
+
+    if a.decode_url:
+        pid = post_id_from_url(a.decode_url)
+        log("解出的 postId = %s" % pid if pid else "未能从链接中解出 postId")
+        return 0 if pid else 1
 
     if a.resolve_uid:
         tk = re.sub(r"^[bB]earer\s+", "", (a.token or os.environ.get("ZEEHO_TOKENS", "")).strip().split("@")[0].split(":")[0])
@@ -476,19 +533,29 @@ def main():
     valid = [x for x in accs if x["token"]]
     log("共 %d 个账号" % len(valid))
 
+    # 手动指定的 postId：命令行优先，其次环境变量
+    raw_pids = a.post_id or os.environ.get("ZEEHO_POST_ID", "")
+    if raw_pids:
+        # 环境变量里允许直接贴整条分享链接
+        for piece in re.split(r"[\s,]+", raw_pids.strip()):
+            if piece.startswith("http"):
+                raw_pids = raw_pids.replace(piece, post_id_from_url(piece) or piece)
+    pids = parse_post_ids(raw_pids, len(valid))
+
     if a.dry_run:
         for i, x in enumerate(valid, 1):
-            log("  #%d token=%s userId=%s" % (i, mask(x["token"]), x["userId"] or "(未提供, 运行时自动解析)"))
-        log("✅ 配置可用。userId 不再是必填项 —— 缺失时脚本会先从 H5 端用户信息接口解析，"
-            "再退化为按 token 识别本人动态。")
+            log("  #%d token=%s userId=%s postId=%s"
+                % (i, mask(x["token"]), x["userId"] or "(自动解析)", pids[i - 1] or "(自动查找)"))
+        log("✅ 配置可用。userId 与 postId 都不是必填项 —— 缺失时脚本会自己想办法。")
         return 0
 
     rows = []
     for i, x in enumerate(valid, 1):
         name = "账号%d (%s)" % (i, mask(x["token"]))
         log("\n" + "=" * 70)
-        log("▶ %s  userId=%s" % (name, x["userId"] or "未提供（将自动尝试解析）"))
-        r = do_like(x, a.status_only, allow_community)
+        extra = "  postId=%s" % pids[i - 1] if pids[i - 1] else ""
+        log("▶ %s  userId=%s%s" % (name, x["userId"] or "未提供（自动解析）", extra))
+        r = do_like(x, a.status_only, allow_community, forced_post=pids[i - 1] or None)
         for d in r["detail"]:
             log("   " + d)
         if r.get("score_after") is not None:
