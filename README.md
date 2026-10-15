@@ -175,15 +175,25 @@ sign = md5( sha1(raw) 的 hex )
 但请求体必须是**实际发出的紧凑 JSON**（`json.dumps(body, separators=(',',':'))`）。
 用空串签名时，GET 能过，**POST 一律返回 `30121 permit error`** —— 这是逆向时最卡人的一步。
 
-### 需要额外一步：拿到 userId
+### userId 是**可选的**，脚本会自己想办法
 
-点赞比签到多一个数字形式的 `userId`。三种获取方式，推荐第一种：
+脚本按三级降级来解决 userId，绝大多数情况下你什么都不用配：
 
-1. **脚本自助获取**（最简单）
+1. **自动解析**：用同一个 token 去打 H5 端的用户信息接口
+   （`/cfmotoservermine/H5/baseInfo`），返回体里通常就带数字 id，脚本自动取用
+2. **按 token 识别**：即使拿不到 id，查本人动态时不传 `userId` 参数，服务端会根据
+   `Authorization` 判断是哪个用户
+3. **明确提示**：以上都不行时，日志会给出可操作建议，而不会再笼统报「缺少 userId」
+
+只有当你想看**积分余额**（`data.score`）时才真正需要 userId —— 因为它嵌在 URL 路径里。
+
+确实想知道的话，三种方式：
+
+1. **脚本自助获取**
    ```bash
    python zeeho_like.py --token 你的token --resolve-uid
    ```
-   会依次尝试几个「返回自身资料」的接口，命中就直接打印 `ZEEHO_TOKENS = <token>:<userId>`。
+   优先走 H5 端，命中就直接打印 `ZEEHO_TOKENS = <token>:<userId>`。
 
 2. **手机抓包**
    MitM 监听 `tapi.zeehoev.com`，打开极核 App 的「我的」页，

@@ -54,7 +54,7 @@ jobs:
           fi
 
           if [ -z "${ZEEHO_TOKENS}" ]; then
-            echo "::error::未配置 secrets.ZEEHO_TOKENS（格式: <token>:<userId>，多账号用 @ 分隔）"
+            echo "::error::未配置 secrets.ZEEHO_TOKENS。直接填签到用的纯 token 即可，userId 可选"
             exit 1
           fi
 

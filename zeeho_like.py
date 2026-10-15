@@ -195,6 +195,52 @@ def parse_accounts(raw_tokens, raw_uids):
     return out
 
 
+# ---------------- H5 端（用于自动解析 userId）----------------
+H5_HOST = "h5.zeehoev.com"
+H5_APP_ID = "AiTXmBrm"
+H5_APP_SECRET = "70c2c7458ab88ca9504ad0521f170075bc91f2f7"
+H5_UA = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+
+
+def h5_sign(query_str, body_str=""):
+    nonce = str(uuid.uuid4())
+    ts = str(int(time.time() * 1000))
+    param = "appId=%s&nonce=%s&timestamp=%s" % (H5_APP_ID, nonce, ts)
+    raw = query_str + body_str + param + H5_APP_SECRET
+    sg = hashlib.md5(hashlib.sha1(raw.encode("utf-8")).hexdigest().encode("utf-8")).hexdigest()
+    return sg, param, ts, nonce
+
+
+def h5_request(path, token, params=None):
+    """签发到时复用的 H5 客户端；同一个 token 在 H5 端也能用。"""
+    params = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
+    query_str = "&".join("%s=%s" % (k, v) for k, v in params.items())
+    sg, param, ts, nonce = h5_sign(query_str)
+    headers = {
+        "Content-Type": "application/json;charset=UTF-8",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://" + H5_HOST,
+        "Referer": "https://%s/activity/signin" % H5_HOST,
+        "User-Agent": H5_UA,
+        "Authorization": "Bearer " + token,
+        "Cfmoto-X-Sign": sg,
+        "Cfmoto-X-Sign-Type": "0",
+        "Cfmoto-X-Param": param,
+        "timestamp": ts,
+        "nonce": nonce,
+    }
+    url = path + (("?" + query_str) if query_str else "")
+    try:
+        conn = http.client.HTTPSConnection(H5_HOST, timeout=TIMEOUT, context=CTX)
+        conn.request("GET", url, headers=headers)
+        r = conn.getresponse()
+        txt = r.read().decode("utf-8", "ignore")
+        conn.close()
+        return r.status, parse_body(txt)
+    except Exception as e:
+        return -1, {"code": "-1", "message": str(e)}
+
+
 DIGITS = r"\d{6,20}"
 UID_KEYS = ("userId", "id", "uid", "memberId", "accountId", "custId", "userNo")
 
@@ -220,11 +266,44 @@ def deep_find_uid(obj, depth=0):
     return None
 
 
+def autofill_uid(token):
+    """
+    自动补 userId：同一个 token 在 H5 端调一下用户信息接口，返回体里几乎必然带数字 id。
+    这样就不用手工抓包了。拿不到则返回 ""，调用方继续走「不带 userId」的降级路径。
+    """
+    for p in ("/cfmotoservermine/H5/baseInfo", "/cfmotoservermine/baseInfo"):
+        st, d = h5_request(p, token)
+        if st != 200:
+            continue
+        uid = deep_find_uid(d)
+        if uid:
+            log("   🔎 自动取到 userId=%s（来源 %s）" % (uid, p))
+            return uid
+    return ""
+
+
+def fetch_score(token, uid):
+    """查积分余额；没有 userId 时跳过（不影响点赞本身）"""
+    if not uid:
+        return None
+    st, d = request("GET", P_SETTING.format(uid=uid), token, uid)
+    if st == 200 and isinstance(d, dict) and isinstance(d.get("data"), dict):
+        return d["data"].get("score")
+    return None
+
+
 def resolve_uid(token):
     """
-    自助获取 userId：依次尝试几个「返回自身资料」的接口。
+    自助获取 userId：优先走 H5 端（token 通用、无需抓包），再试 App 端若干接口。
     这些接口都需要有效 token；用真 token 跑一次即可拿到数字 userId。
     """
+    uid = autofill_uid(token)
+    if uid:
+        print("\n请把下面这组配置填进 GitHub Secrets：")
+        print("    ZEEHO_TOKENS = %s:%s" % (token, uid))
+        return uid
+
+    print("  ※ H5 端未返回 id，继续尝试 App 端…\n")
     candidates = [
         ("GET", "/v1.0/mine/cfmotoservermine/setting", {}),
         ("GET", "/v1.0/mine/cfmotoservermine/setting/", {}),
@@ -248,25 +327,34 @@ def resolve_uid(token):
     print("  MitM 监听 tapi.zeehoev.com，打开「我的」页，")
     print("  请求 URL /v1.0/mine/cfmotoservermine/setting/<数字> 里那段数字即 userId。")
     return None
-def do_like(acc, status_only=False, allow_community=False):
-    tk, uid = acc["token"], acc["userId"]
-    res = {"ok": False, "liked": False, "postId": "", "score": None, "detail": [], "err": ""}
 
-    if uid:
-        st, d = request("GET", P_SETTING.format(uid=uid), tk, uid)
-        if st == 200 and isinstance(d, dict) and isinstance(d.get("data"), dict):
-            res["score"] = d["data"].get("score")
+
+def do_like(acc, status_only=False, allow_community=False, auto_uid=True):
+    tk = acc["token"]
+    uid = acc["userId"] or ""
+    res = {"ok": False, "liked": False, "postId": "", "score": None,
+           "uid": uid, "detail": [], "err": ""}
+
+    # userId 不是硬要求：先尽力自动补，补不到也能继续跑（服务端按 token 识别）
+    if not uid and auto_uid:
+        uid = autofill_uid(tk)
+        res["uid"] = uid
+
+    res["score"] = fetch_score(tk, uid)
     if status_only:
         res["ok"] = True
         return res
 
-    # 1) 找自己的帖子
+    # 1) 找自己的帖子 —— 没有 userId 时不传该参数，服务端据 token 返回本人动态
     post = None
+    p = {"page": 1, "pageSize": 10}
     if uid:
-        st, d = request("GET", P_MINE_ARTICLES, tk, uid, {"userId": uid, "page": 1, "pageSize": 10})
-        if st == 200 and d.get("code") == OK_CODE:
-            post = pick_post_id(d.get("data"), uid)
-        res["detail"].append("查询本人动态: HTTP %s, postId=%s" % (st, post or "无"))
+        p["userId"] = uid
+    st, d = request("GET", P_MINE_ARTICLES, tk, uid, p)
+    if st == 200 and d.get("code") == OK_CODE:
+        post = pick_post_id(d.get("data"), uid)
+    res["detail"].append("查询本人动态: HTTP %s, postId=%s%s"
+                         % (st, post or "无", "" if uid else "（未提供 userId，按 token 识别）"))
 
     # 2) 兜底: 公共流（默认关闭）—— 挑一条热门帖，通常是官方/车主内容
     if not post and allow_community:
@@ -286,8 +374,11 @@ def do_like(acc, status_only=False, allow_community=False):
         res["detail"].append("查询公共动态: %s" % (post or "无"))
 
     if not post:
-        res["err"] = "未找到可点赞的动态（自己在社区没有发过帖）"
         res["ok"] = True
+        res["err"] = ("自己的动态列表是空的。" if uid
+                      else "取不到 userId，且无法按 token 识别到本人动态。")
+        res["err"] += (" 想在这种情况也拿分，请把 Secret ENABLE_COMMUNITY_LIKE 设为 1"
+                       "（会去赞社区推荐流里的热门内容），或先手动发过一条动态。")
         return res
 
     # 3) 点赞
@@ -307,14 +398,12 @@ def do_like(acc, status_only=False, allow_community=False):
         res["ok"] = True
         res["err"] = "点赞未成功: %s %s" % (code, msg)
 
-    # 4) 事后积分（对比）
-    if uid:
-        st2, d2 = request("GET", P_SETTING.format(uid=uid), tk, uid)
-        if st2 == 200 and isinstance(d2, dict) and isinstance(d2.get("data"), dict):
-            after = d2["data"].get("score")
-            res["score_after"] = after
-            if isinstance(after, int) and isinstance(res["score"], int):
-                res["gain"] = after - res["score"]
+    # 4) 事后积分（对比）；没 userId 时跳过
+    after = fetch_score(tk, uid)
+    if after is not None:
+        res["score_after"] = after
+        if isinstance(after, int) and isinstance(res["score"], int):
+            res["gain"] = after - res["score"]
     return res
 
 
@@ -325,7 +414,7 @@ def write_summary(rows):
              "| 账号 | userId | 结果 | 点赞对象 | 积分变化 |", "|---|---|---|---|---|"]
     for r in rows:
         lines.append("| %s | %s | %s | %s | %s |" % (
-            r["name"], r["userId"] or "—",
+            r["name"], r.get("uid") or "自动",
             ("✅ 已点赞" if r.get("liked") else ("⚠️ " + (r.get("err") or "跳过"))),
             r.get("postId") or "—",
             ("%s → %s" % (r.get("score"), r.get("score_after"))) if r.get("score_after") is not None else "—"))
@@ -389,21 +478,16 @@ def main():
 
     if a.dry_run:
         for i, x in enumerate(valid, 1):
-            log("  #%d token=%s userId=%s" % (i, mask(x["token"]), x["userId"] or "❌缺失"))
-        bad = [x for x in valid if not x["userId"]]
-        if bad:
-            log("⚠️ %d 个账号缺 userId，会跳过（userId 获取方式见 README）" % len(bad))
+            log("  #%d token=%s userId=%s" % (i, mask(x["token"]), x["userId"] or "(未提供, 运行时自动解析)"))
+        log("✅ 配置可用。userId 不再是必填项 —— 缺失时脚本会先从 H5 端用户信息接口解析，"
+            "再退化为按 token 识别本人动态。")
         return 0
 
     rows = []
     for i, x in enumerate(valid, 1):
         name = "账号%d (%s)" % (i, mask(x["token"]))
         log("\n" + "=" * 70)
-        log("▶ %s  userId=%s" % (name, x["userId"] or "缺失"))
-        if not x["userId"]:
-            rows.append({"name": name, "userId": "", "liked": False,
-                         "postId": "", "score": None, "err": "缺少 userId"})
-            continue
+        log("▶ %s  userId=%s" % (name, x["userId"] or "未提供（将自动尝试解析）"))
         r = do_like(x, a.status_only, allow_community)
         for d in r["detail"]:
             log("   " + d)
