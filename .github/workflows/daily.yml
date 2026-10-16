@@ -1,9 +1,10 @@
-name: ZEEHO 每日互动任务
+name: ZEEHO 每日自动化
 
 on:
   schedule:
-    # 每天 08:50（北京时间）= 00:50 UTC，避开 08:30 的签到任务
-    - cron: "50 0 * * *"
+    # 每天 08:30（北京时间）= 00:30 UTC
+    # GitHub Actions 的 cron 使用 UTC 时区
+    - cron: "30 0 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -12,10 +13,12 @@ on:
         default: "run"
         type: choice
         options:
-          - "run"
-          - "status-only"
-          - "dry-run"
-          - "resolve-uid"
+          - "run"           # 先签到，后互动（默认）
+          - "signin-only"   # 只签到
+          - "interact-only" # 只互动
+          - "status-only"   # 只查状态
+          - "dry-run"       # 只自检，不联网
+          - "resolve-uid"   # 自助获取 userId
       community:
         description: "自己没动态时，允许点赞公共动态"
         required: false
@@ -24,7 +27,7 @@ on:
         options: ["false", "true"]
 
 jobs:
-  interact:
+  daily:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -37,7 +40,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 执行每日互动任务
+      - name: 执行（先签到，后互动）
         env:
           ZEEHO_TOKENS: ${{ secrets.ZEEHO_TOKENS }}
           ZEEHO_USER_IDS: ${{ secrets.ZEEHO_USER_IDS }}
@@ -49,10 +52,11 @@ jobs:
           NOTIFY_SERVERCHAN: ${{ secrets.NOTIFY_SERVERCHAN }}
         run: |
           set -euo pipefail
+          MODE="${{ github.event.inputs.mode }}"
 
-          if [ "${{ github.event.inputs.mode }}" = "dry-run" ]; then
+          if [ "$MODE" = "dry-run" ]; then
             echo "::notice::dry-run 模式：只做本地自检，不联网、不发请求"
-            ZEEHO_TOKENS="${ZEEHO_TOKENS:-demo-token-0000-0000:1234567}" python zeeho_like.py --dry-run
+            ZEEHO_TOKENS="${ZEEHO_TOKENS:-demo-token-0000-0000:1234567}" python zeeho.py --dry-run
             exit 0
           fi
 
@@ -61,19 +65,20 @@ jobs:
             exit 1
           fi
 
-          EXTRA=""
-          case "${{ github.event.inputs.mode }}" in
-            status-only)  EXTRA="--status-only" ;;
+          EXTRA="--spread-seconds 600"
+          case "$MODE" in
+            signin-only)  EXTRA="$EXTRA --signin-only" ;;
+            interact-only) EXTRA="$EXTRA --interact-only" ;;
+            status-only)  EXTRA="$EXTRA --status-only" ;;
             resolve-uid)  EXTRA="--resolve-uid" ;;
-            *)            EXTRA="--spread-seconds 600" ;;
           esac
 
           if [ "${{ github.event.inputs.community }}" = "true" ]; then
             EXTRA="$EXTRA --community"
           fi
 
-          python zeeho_like.py $EXTRA || {
+          python zeeho.py $EXTRA || {
             code=$?
-            echo "::warning::zeeho_like.py 退出码 $code（2 表示没有任何步骤产出）"
+            echo "::warning::zeeho.py 退出码 $code（2 表示有步骤未成功）"
             exit 0
           }

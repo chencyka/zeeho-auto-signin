@@ -1,8 +1,15 @@
-# ZEEHO 极核每日自动化（签到 + 点赞）
+# ZEEHO 极核每日自动化（签到 + 互动）
 
-每天自动给极核（ZEEHO / 春风动力 CFMOTO）App 账号签到，跑在 **GitHub Actions** 上，无需服务器、无需手机常开。
+跑在 **GitHub Actions** 上，无需服务器、无需手机常开。**一次运行做完两件事，先签到，后互动：**
 
-签到流程移植自 [MonicaGmm/zeeho-quanx](https://github.com/MonicaGmm/zeeho-quanx)（Quantumult X 版），本仓库是其 Python 实现 + GitHub Actions 定时部署。
+```
+① 签到   +1 分（连签另有盲盒）
+② 互动   发帖 +1 / 点赞 +1 / 分享 +1，最多 3 分
+```
+
+签到流程移植自 [MonicaGmm/zeeho-quanx](https://github.com/MonicaGmm/zeeho-quanx)（Quantumult X 版），
+互动流程移植自 [cluck798/zeeho](https://github.com/cluck798/zeeho) 的 Android 版
+（源码来自 `ZEEHO助手.apk` 逆向），本仓库是两者的 Python 合并实现。
 
 > **本项目与极核（ZEEHO）/ 春风动力（CFMOTO）无任何关联，也不是官方产品。**
 > 仅供个人学习与自用。禁止用于商业用途、批量账号、灰产或任何违反极核用户协议的行为。
@@ -23,20 +30,25 @@
 
 | Name | Value |
 | --- | --- |
-| `ZEEHO_TOKENS` | 你的 Token，多账号用逗号或换行分隔 |
+| `ZEEHO_TOKENS` | `<token>:<userId>`，多账号用 `@` 分隔。**纯 token 也能跑** |
 
-可选（推送通知，不配则只写日志和 Summary）：
+可选：
 
 | Name | Value |
 | --- | --- |
+| `ZEEHO_POST_ID` | 指定已有动态 ID（或分享链接）。填了就只点赞，不发帖不删帖 |
+| `ZEEHO_POST_CONTENT` | 临时帖内容，默认 `开心的一天` |
+| `INTERACT_STEPS` | 逗号分隔 `publish,like,share,delete`，不填默认全做 |
 | `NOTIFY_BARK` | Bark 地址，如 `https://api.day.app/你的key` |
 | `NOTIFY_SERVERCHAN` | Server酱 SendKey |
 
 ### 3. 启用并手动测试
 
-**Actions → ZEEHO 每日签到 → Run workflow**，先跑一次确认能通。
+**Actions → ZEEHO 每日自动化 → Run workflow**，先跑一次确认能通。
 
-之后每天 **08:30（北京时间）** 自动执行。
+之后每天 **08:30（北京时间）** 自动执行，签到完成后紧接着跑互动。
+
+> ⚠️ **私有仓库 + 免费账号不会跑定时任务**，见文末「常见问题」最后一条。
 
 ---
 
@@ -72,12 +84,19 @@ https://h5.zeehoev.com/activity/signin?token=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx
 
 ```bash
 # 只需要 Python 3.8+，无第三方依赖
-export ZEEHO_TOKENS="uuid1,uuid2"
+export ZEEHO_TOKENS="uuid1:1234567@uuid2:7654321"
 
-python zeeho_signin.py                  # 执行签到
-python zeeho_signin.py --status-only    # 只查状态，不签到
-python zeeho_signin.py --dry-run        # 打印请求详情，不真正发送
-python zeeho_signin.py --token "uuid"   # 单个 Token 直接传
+python zeeho.py                       # 先签到，后互动（默认）
+python zeeho.py --signin-only         # 只签到
+python zeeho.py --interact-only       # 只互动
+python zeeho.py --status-only         # 只查状态，不执行
+python zeeho.py --dry-run             # 只自检，不联网
+python zeeho.py --token "uuid"        # 单个 Token 直接传
+python zeeho.py --steps publish,like  # 自定义互动步骤
+python zeeho.py --content "今天天气不错"
+python zeeho.py --keep                # 发完帖不删除
+python zeeho.py --resolve-uid         # 自助获取 userId
+python zeeho.py --decode-url "https://h5.zeehoev.com/post?uuid=xxx"
 ```
 
 ---
@@ -86,27 +105,38 @@ python zeeho_signin.py --token "uuid"   # 单个 Token 直接传
 
 这些是逆向 + 实测得到的，改脚本前先看这里。
 
-### 基础信息
+两件事走**完全不同的两套后端**：
 
-| 项 | 值 |
-| --- | --- |
-| Host | `https://h5.zeehoev.com` |
-| 鉴权 | `Authorization: Bearer <token>`（UUID） |
-| 签名 | `Cfmoto-X-Sign = md5(sha1(v))` |
+| 项 | 签到 | 互动 |
+| --- | --- | --- |
+| Host | `https://h5.zeehoev.com` | `https://tapi.zeehoev.com` |
+| appId | `AiTXmBrm` | `S7qPWPU1` |
+| appSecret | `70c2c7458ab88ca9504ad0521f170075bc91f2f7` | `c5e0da7f4da28df805694ec3dd1fc6792e9df99d` |
+| 鉴权 | `Authorization: Bearer <token>`（UUID） | 同 |
+| 额外头 | `Origin` / `Referer` / `Zeeho-User-Agent` | `user_id` / `interfaceversion: 2` |
 
 ### 签名算法
 
+两端公式一致：
+
 ```
-v = 查询串 + 请求体 + "appId=<APP_ID>&nonce=<uuid>&timestamp=<毫秒>" + <APP_SECRET>
-Cfmoto-X-Sign     = md5(sha1(v))
-Cfmoto-X-Param    = appId=<APP_ID>&nonce=<nonce>&timestamp=<ts>
-Cfmoto-X-Sign-Type = 0
+param = "appId=<APP_ID>&nonce=<nonce>&timestamp=<毫秒>"
+v     = 查询串 + 请求体 + param + <APP_SECRET>
+sign  = md5( sha1(v) )
 ```
 
-注意：
-- 查询串**不做 URL 编码**，就是 `k=v&k=v`，且只拼非空参数
-- 请求体是 JSON 字符串；GET 请求时为空串
-- `md5(sha1(...))` 是两层，sha1 输出 hex 字符串后再 md5
+容易出错的三处：
+
+1. **查询串要按 key 字典序排序**（App 端 `SignUtil.toQuery` 里是 `Collections.sort`）。
+   插入顺序和排序顺序在多参数时不同，签名就会对不上。签到端只有一个参数所以没暴露。
+2. **App 端 nonce 不是 UUID**，是 `<毫秒时间戳> + 16 位随机字母数字`；
+   只有 H5 端才用 UUID。
+3. **请求体必须是实际发出的紧凑 JSON**（`json.dumps(body, separators=(',',':'))`）。
+   用空串签名时 GET 能过，**POST 一律被拦 `30121 permit error`**。
+   另外 DELETE 时 body 强制置空。
+
+其余规则：查询串不做 URL 编码；GET 请求体为空串；`md5(sha1(...))` 是两层，
+sha1 输出 hex 字符串后再 md5。
 
 ### 用到的 4 个接口
 
@@ -132,14 +162,14 @@ H5 全部 22 个接口里没有返回余额的。`integralScore` 是**当天签�
 
 - 2026-10-10：签到接口迁移到 `/cfmotoservermine/H5/` 前缀，同时换发 appId/appSecret。旧 `AppID=Sw5F9uJi` 和旧路径都会被网关拦成 `30125 permit error`。
 - 当前值：`APP_ID = AiTXmBrm`，`APP_SECRET = 70c2c7458ab88ca9504ad0521f170075bc91f2f7`
-- **如果所有账号都报 30125 / 30121 / permit error，就是又轮换了**，重新抓包换 `zeeho_signin.py` 顶部的两个常量。签名算法本身（`md5(sha1(...))`）一直没变。
+- **如果所有账号都报 30125 / 30121 / permit error，就是又轮换了**，重新抓包换 `zeeho.py` 顶部的两个常量。签名算法本身（`md5(sha1(...))`）一直没变。
 
 ---
 
-## 五、每日互动任务（发帖 + 点赞 + 分享）
+## 五、互动任务（发帖 + 点赞 + 分享）
 
 极核的互动任务是分开计分的：**发帖 +1、点赞 +1、分享 +1**，一天最多 3 分。
-`zeeho_like.py` 把这三件都做了，**签到由 `zeeho_signin.py` 单独负责，两者互不影响**。
+`zeeho.py` 把这三件都做了，和签到在同一个脚本里按顺序执行。
 
 ### 发的是「临时帖」，最后会删掉
 
@@ -156,58 +186,25 @@ H5 全部 22 个接口里没有返回余额的。`integralScore` 是**当天签�
 如果你通过 `ZEEHO_POST_ID` 指定了已有动态，删除步骤会直接跳过并记一行日志 ——
 绝不会删你真实发过的内容。
 
-### 与签到的差异（改代码前必看）
-
-| 项 | 签到 `zeeho_signin.py` | 点赞 `zeeho_like.py` |
-| --- | --- | --- |
-| **域名** | `h5.zeehoev.com`（H5 端） | **`tapi.zeehoev.com`（App 端）** |
-| appId | `AiTXmBrm` | **`S7qPWPU1`** |
-| appSecret | `70c2c7458ab88ca9504ad05…` | **`c5e0da7f4da28df805694ec3…`** |
-| 额外头 | — | `user_id`、`interfaceversion: 2` |
-| 需要 userId | 否 | **是** |
-| 定时 | 每天 08:30 | 每天 08:50 |
-
-两套体系**互不通用**：拿 H5 的 appId 去打 App 端接口会被拦成 `30121 permit error`。
-
-### 接口清单
+### 互动接口清单
 
 | 方法 | 路径（`https://tapi.zeehoev.com`） | 用途 |
 | --- | --- | --- |
 | GET | `/v1.0/mine/cfmotoservermine/integral/totalIntegral` | 积分余额，**不需要 userId** |
 | GET | `/v1.0/mine/cfmotoservermine/setting/{userId}` | 用户资料，含 `data.score` |
-| GET | `/v1.0/social/cfmotoserversocial/community/mineArticleInfo?userId=&page=1&pageSize=10` | 取本人动态列表 |
-| GET | `/v1.0/social/cfmotoserversocial/community/qbTzInfoNewV2?page=1&pageSize=20&postModule=2&slidingType=1` | 公共推荐流（兜底用，默认关闭） |
-| **POST** | `/v1.0/social/cfmotoserversocial/socialCommu/likeFavoriteInfo` | **点赞**，body `{"postId":"…","kindFlag":"0"}` |
-
-同源但本仓库**未启用**的接口（已从 `ZEEHO助手.apk` 完整逆向出来，留档备用）：
-
-| 方法 | 路径 | body / 参数 |
-| --- | --- | --- |
+| GET | `…/community/mineArticleInfo?userId=&page=1&pageSize=10` | 取本人动态列表 |
+| GET | `…/community/qbTzInfoNewV2?page=1&pageSize=20&postModule=2&slidingType=1` | 公共推荐流（默认关闭） |
 | POST | `…/commonArticle` | 发帖：`{postSubInfo:{topicList:[]}, topicid:"", postcontent:"文本"}` |
+| POST | `…/socialCommu/likeFavoriteInfo` | **点赞**，body `{"postId":"…","kindFlag":"0"}` |
 | PUT | `…/article/share/{postId}` | 分享（无 body） |
 | DELETE | `…/commonArticle/deleteArticle?articleId=&postType=1` | 删帖 |
-| GET | `…/integral/adjustByShare` | 领取分享积分 |
+| GET | `/v1.0/mine/…/integral/adjustByShare` | 领取分享积分 |
 
-完整顺序（APK 的 `TaskRunner.autoPublish`）：发帖 → 等 2s → 查动态（取 `data[0]`，ID 依次试
-`tuuid` → `id` → `articleId`）→ 等 1s → 点赞 → 等 1s → 分享 → 领积分 → 等 2s → 删除。
+> 缺 `slidingType` 会报 `40004 滑动类型不能为空`。
 
-### 签名的三个细节（照抄 `SignUtil.java`）
-
-```
-raw  = 查询串 + 请求体 + "appId=S7qPWPU1&nonce=<nonce>&timestamp=<ms>" + <APP_SECRET>
-sign = md5( sha1(raw) 的 hex )
-```
-
-容易出错的三处：
-
-1. **查询串要按 key 字典序排序**（`Collections.sort`）。插入顺序和排序顺序在多参数时不同，
-   签名就会对不上。→ 见 `to_query()`
-2. **App 端 nonce 不是 UUID**，是 `<毫秒时间戳> + 16 位随机字母数字`；
-   只有 H5 端才用 UUID。→ 见 `app_nonce()`
-3. **DELETE 时请求体强制为空**（`SignUtil` 里 `"DELETE".equals(method)` 分支）
-
-其余规则：查询串不做 URL 编码；请求体必须是**实际发出的紧凑 JSON**
-（`json.dumps(body, separators=(',',':'))`）—— 用空串签名时 GET 能过，**POST 一律被拦 `30121`**。
+执行顺序（移植自 APK 的 `TaskRunner.autoPublish`）：
+发帖 → 等 2~4s → 点赞 → 等 2~4s → 分享 → 领积分 → 等 2~4s → 删除。
+取动态时 ID 依次试 `tuuid` → `id` → `articleId`。
 
 ### userId 是**可选的**，脚本会自己想办法
 
@@ -225,7 +222,7 @@ sign = md5( sha1(raw) 的 hex )
 
 1. **脚本自助获取**
    ```bash
-   python zeeho_like.py --token 你的token --resolve-uid
+   python zeeho.py --token 你的token --resolve-uid
    ```
    优先走 H5 端，命中就直接打印 `ZEEHO_TOKENS = <token>:<userId>`。
 
@@ -252,27 +249,25 @@ sign = md5( sha1(raw) 的 hex )
 - 配了 `ZEEHO_POST_ID` → 自动降为 `like` 单一项，不发帖、不删除
 - 配了 `INTERACT_STEPS` → 以它为准（例：`publish,like` 表示发帖+点赞但**保留该帖不删**）
 
-★ **一句话拿到 `ZEEHO_POST_ID`**（推荐，最省事）
+**「只点赞」模式**：想退回早期行为（不发帖、不分享，只 +1 分），
+把 `INTERACT_STEPS` 设成 `like` 即可。
 
-在极核 App 里打开**你自己的某条动态** → 分享 → 复制链接，会得到形如：
+`ZEEHO_POST_ID` 可以从动态分享链接拿到（`uuid` 参数是 postId 的 Base64）：
 
 ```
 https://h5.zeehoev.com/post?time=1792056147099&uuid=MjAyNjEwMTUwMDg4MDkzMTU=
 ```
 
-那个 `uuid=` 就是 postId 的 Base64。直接把**整条链接**粘进 `ZEEHO_POST_ID` 即可，脚本自己解：
+整条链接粘进 `ZEEHO_POST_ID` 即可，脚本自己解。也可以本地跑
+`python zeeho.py --decode-url "<链接>"` 查看解出的 postId：
 
 ```bash
-python zeeho_like.py --decode-url "https://h5.zeehoev.com/post?uuid=MjAyNjEwMTUwMDg4MDkzMTU="
+python zeeho.py --decode-url "https://h5.zeehoev.com/post?uuid=MjAyNjEwMTUwMDg4MDkzMTU="
 # 解出的 postId = 20261015008809315
 ```
 
 配了它，脚本会跳过动态查询直接点赞，**完全不依赖 userId**。
 多账号时用 `@` 分隔；只填一个则所有账号共用。
-
-> **透明度说明**：`ZEEHO_TOKENS` 现在是「token + userId」的组合格式，与签到任务共用同一个 Secret 也没问题 ——
-> 签到脚本只取 `:` 前面的部分识别不到时会降级按纯 token 处理；如果你担心串号，
-> 可以在点赞工作流里单独配一个 Secret（比如 `ZEEHO_LIKE_TOKENS`）并改 yml 里的环境变量名。
 
 ### 备用签到路径（服务端换 key 时的退路）
 
@@ -285,8 +280,8 @@ python zeeho_like.py --decode-url "https://h5.zeehoev.com/post?uuid=MjAyNjEwMTUw
 | 额外参数 | — | `server_name=SMART` |
 | nonce | UUID | UUID（走 h5 分支） |
 
-若哪天签到报 `30125 permit error`（密钥轮换），把 `zeeho_signin.py` 里的
-`APP_ID`/`APP_SECRET` 换成 `S7qPWPU1`/`c5e0…`、路径去掉 `/H5/`、GET 参数加上
+若哪天签到报 `30125 permit error`（密钥轮换），把 `zeeho.py` 里的
+`H5_APP_ID`/`H5_APP_SECRET` 换成 `S7qPWPU1`/`c5e0…`、路径去掉 `/H5/`、GET 参数加上
 `server_name=SMART`，多半就能救回来。
 
 ### 行为策略
@@ -348,7 +343,7 @@ curl -H "Authorization: token <PAT>" \
 A：GitHub 对 scheduled workflow 还有两条限制——高峰可能延迟几分钟到十几分钟；仓库 **60 天无任何活动**会被自动停用定时任务。偶尔手动 Run 一下就能恢复。
 
 **Q：想改签到时间**
-A：改 `.github/workflows/signin.yml` 里的 cron。**注意是 UTC**：
+A：改 `.github/workflows/daily.yml` 里的 cron。**注意是 UTC**：
 
 | 北京时间 | cron（UTC） |
 | --- | --- |
@@ -365,13 +360,9 @@ A：支持。`ZEEHO_TOKENS` 里用逗号或换行分隔多个 Token，脚本会�
 
 ```
 .
-├── .github/
-│   ├── workflows/signin.yml   # 定时任务：每日 08:30 签到
-│   └── workflows/like.yml     # 定时任务：每日 08:50 点赞
-├── zeeho_signin.py            # 签到脚本（H5 端，纯标准库）
-├── zeeho_like.py              # 点赞脚本（App 端，纯标准库）
-├── probe_social.py            # 社区接口探测工具（需真 token）
-├── .gitignore                 # 已排除凭据文件
+├── .github/workflows/daily.yml   # 唯一的定时任务：每日 08:30，先签到后互动
+├── zeeho.py                      # 合并脚本（纯标准库，签到 + 互动）
+├── .gitignore                    # 已排除凭据文件
 └── README.md
 ```
 
