@@ -2,8 +2,8 @@ name: schedule-probe
 
 on:
   schedule:
-    # UTC 03:46 = 北京 11:46（一次性验证用，确认后删除）
-    - cron: "46 3 * * *"
+    # 每 5 分钟跑一次，只 echo —— 用于验证 schedule 是否恢复，确认后立即删除
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 jobs:
