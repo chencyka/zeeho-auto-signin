@@ -312,8 +312,40 @@ A：Secret 名字要完全一致，且大小写敏感。
 **Q：提示连不上 / 超时**
 A：`h5.zeehoev.com` 是国内域名。GitHub Actions 本身是直连的，一般不会遇到；本地跑如果挂了代理，关掉或加直连规则。
 
-**Q：定时任务没跑**
-A：GitHub 对 scheduled workflow 有两条限制——高峰可能延迟几分钟到十几分钟；仓库 **60 天无任何活动**会被自动停用定时任务。偶尔手动 Run 一下就能恢复。
+**Q：定时任务完全没跑，但手动 Run 一切正常**
+A：**这是最常见的原因，而且 GitHub 文档里几乎没写** ——
+
+> **免费个人账号 + 私有仓库 = 不支持 `schedule` 定时触发。**
+
+`workflow_dispatch`（手动）完全正常，cron 却永远不触发。API 侧表现很有迷惑性：
+workflow 的 `state` 依然是 `active`，`actions/permissions` 也是 `enabled: true`，
+运行记录里只会看到手动触发的那些，`event=schedule` 的记录数是 0。
+
+确认方法（需要 GitHub API）：
+
+```bash
+curl -H "Authorization: token <PAT>" \
+  "https://api.github.com/repos/<owner>/<repo>/actions/runs?per_page=15"
+# 看 event 字段：全是 workflow_dispatch 而 schedule 是 0，就是这个限制
+```
+
+三种解法：
+
+| 方案 | 成本 | 说明 |
+| --- | --- | --- |
+| 仓库改公开 | 0 | 立即生效。前提是确认仓库里没有 Token（本仓库已扫过全历史） |
+| 升级 GitHub Pro | \$4/月 | 私有仓库即可用定时 |
+| 外部 cron + `workflow_dispatch` API | 0 | cron-job.org 等定时调 `POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches`，需带 `workflow` 权限的 PAT |
+
+**其他可能**（本仓库已全部排除）：默认分支不对、cron 语法错、仓库是 fork、
+60 天无活动被自动停用、Actions 被设置禁用、分钟数配额用尽。
+
+> 小技巧：想确认定时是否恢复，可以临时加一个只 `echo` 的探针 workflow，
+> cron 设成 `*/5 * * * *`，几分钟内就能从运行记录里看到 `event=schedule`，
+> 确认后删掉它，别用它跑正式任务。
+
+**Q：定时任务没跑（其他原因）**
+A：GitHub 对 scheduled workflow 还有两条限制——高峰可能延迟几分钟到十几分钟；仓库 **60 天无任何活动**会被自动停用定时任务。偶尔手动 Run 一下就能恢复。
 
 **Q：想改签到时间**
 A：改 `.github/workflows/signin.yml` 里的 cron。**注意是 UTC**：
