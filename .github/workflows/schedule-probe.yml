@@ -1,0 +1,25 @@
+name: schedule-probe
+
+on:
+  schedule:
+    # UTC 03:46 = 北京 11:46（一次性验证用，确认后删除）
+    - cron: "46 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: 确认 schedule 是否触发
+        run: |
+          echo "github.event_name = ${{ github.event_name }}"
+          echo "github.event.schedule = ${{ github.event.schedule }}"
+          echo "UTC now: $(date -u)"
+          echo "Beijing now: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
+          echo ""
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "RESULT: schedule 事件已生效 ✅"
+          else
+            echo "RESULT: 非 schedule 触发（可能是手动）"
+          fi
